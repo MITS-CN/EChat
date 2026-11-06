@@ -1,0 +1,75 @@
+name: Server CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'echat-server/**'
+      - '.github/workflows/server.yml'
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - 'echat-server/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./echat-server # 指定在子目录下执行
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    # 缓存 Cargo 依赖，极大加快后续编译速度
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: echat-server -> target
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build
+      run: cargo build --release
+
+  release:
+    name: Build Release Binary
+    needs: check-and-test
+    if: startsWith(github.ref, 'refs/tags/v') # 只有打上 v0.4.0 这种 tag 时才触发
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./echat-server
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: echat-server -> target
+
+    - name: Build Release
+      run: cargo build --release
+
+    - name: Upload Binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: echat-server-linux
+        path: echat-server/target/release/echat-server
