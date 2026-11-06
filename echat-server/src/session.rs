@@ -19,6 +19,14 @@ pub enum AuthState {
     Authed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShowFilter {
+    All,
+    Lan,
+    Friends(String),
+    Groups(String), // 三期 B
+}
+
 pub struct Session {
     pub id: Uuid,
     pub user: Option<String>,
@@ -27,6 +35,7 @@ pub struct Session {
     pub reg_state: RegState,
     pub connected: HashMap<String, ConnectedServer>,
     pub auth_state: AuthState,
+    pub show_filter: ShowFilter,
 }
 
 pub enum RegState {
@@ -49,17 +58,14 @@ impl Session {
             reg_state: RegState::Idle,
             connected: HashMap::new(),
             auth_state,
+            show_filter: ShowFilter::All,
         }
     }
 }
 
 pub async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let needs_auth = state.access_password_hash.read().await.is_some();
-    let initial_auth = if needs_auth {
-        AuthState::Pending
-    } else {
-        AuthState::Authed
-    };
+    let initial_auth = if needs_auth { AuthState::Pending } else { AuthState::Authed };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -96,9 +102,7 @@ pub async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             break;
                         }
                         Some(m) => {
-                            if ws_tx.send(Message::Text(m.to_json())).await.is_err() {
-                                break;
-                            }
+                            if ws_tx.send(Message::Text(m.to_json())).await.is_err() { break; }
                         }
                         None => break,
                     }
@@ -114,11 +118,9 @@ pub async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        let is_auth = serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
+                        let is_auth = serde_json::from_str::<serde_json::Value>(&text).ok()
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "auth"))
                             .unwrap_or(false);
-
                         if is_auth {
                             handle_auth_frame(&state, session_id, &text, &tx, &session).await;
                         } else {
@@ -157,31 +159,21 @@ async fn handle_auth_frame(
 ) {
     let v: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(_) => {
-            let _ = tx.send(Outgoing::err("认证帧格式错误"));
-            return;
-        }
+        Err(_) => { let _ = tx.send(Outgoing::err("认证帧格式错误")); return; }
     };
     let password = v.get("password").and_then(|p| p.as_str()).unwrap_or("");
     let is_fed_flag = v.get("federation").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    let current = {
-        let s = session.lock().await;
-        s.auth_state.clone()
-    };
+    let current = { session.lock().await.auth_state.clone() };
     if current == AuthState::Authed {
         let _ = tx.send(Outgoing::ok("已认证"));
         return;
     }
 
-    // 联邦模式：用 federation_password 校验（三期逻辑，仅占位）
     if is_fed_flag {
         let fed = state.federation_password.read().await.clone();
         match fed {
-            None => {
-                let _ = tx.send(Outgoing::err("服务端未启用联邦"));
-                return;
-            }
+            None => { let _ = tx.send(Outgoing::err("服务端未启用联邦")); return; }
             Some(hash) => {
                 let ok = PasswordHash::new(&hash)
                     .map(|p| Argon2::default().verify_password(password.as_bytes(), &p).is_ok())
@@ -199,7 +191,6 @@ async fn handle_auth_frame(
         }
     }
 
-    // 普通客户端认证
     let stored = state.access_password_hash.read().await.clone();
     match stored {
         None => {
@@ -209,15 +200,9 @@ async fn handle_auth_frame(
         Some(hash) => {
             let parsed = match PasswordHash::new(&hash) {
                 Ok(p) => p,
-                Err(_) => {
-                    let _ = tx.send(Outgoing::err("服务端接入密码数据损坏，请联系管理员重置"));
-                    return;
-                }
+                Err(_) => { let _ = tx.send(Outgoing::err("服务端接入密码数据损坏")); return; }
             };
-            if Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
-            {
+            if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
                 session.lock().await.auth_state = AuthState::Authed;
                 let _ = tx.send(Outgoing::ok("认证成功"));
             } else {
