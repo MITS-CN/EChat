@@ -220,9 +220,7 @@ pub async fn del_setting(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn delete_setting(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
-    del_setting(pool, key).await
-}
+
 
 /// 启动时扫描用户名大小写冲突。返回冲突组。
 pub async fn scan_case_conflicts(pool: &SqlitePool) -> Vec<Vec<String>> {
