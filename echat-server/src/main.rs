@@ -107,6 +107,26 @@ async fn main() -> anyhow::Result<()> {
     let console_state = state.clone();
     commands::console::run(console_state);
 
+    // ===== 三期 C：启动后台清理任务 =====
+    // 每 24 小时清理一次 30 天前的消息
+    let clean_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            let cutoff_str = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            let res = sqlx::query("DELETE FROM messages WHERE created_at < ?")
+                .bind(&cutoff_str)
+                .execute(&clean_state.db)
+                .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    info!("[自动清理] 已清理 {} 条超过 30 天的旧消息", r.rows_affected());
+                }
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/echat", get(ws_handler))
         .route("/", get(root))
