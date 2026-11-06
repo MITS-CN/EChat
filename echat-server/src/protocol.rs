@@ -7,6 +7,7 @@ pub enum Outgoing {
     Event { source: String, content: String },
     Data { kind: String, data: serde_json::Value },
     Close { reason: String },
+    AuthRequired,
 }
 
 impl Outgoing {
@@ -24,6 +25,9 @@ impl Outgoing {
     }
     pub fn close(reason: impl Into<String>) -> Self {
         Outgoing::Close { reason: reason.into() }
+    }
+    pub fn auth_required() -> Self {
+        Outgoing::AuthRequired
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| {

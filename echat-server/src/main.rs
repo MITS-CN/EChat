@@ -5,6 +5,7 @@ mod protocol;
 mod session;
 mod state;
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use argon2::password_hash::rand_core::OsRng;
@@ -16,15 +17,52 @@ use axum::routing::get;
 use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
+use tracing_subscriber::Layer;
+
+struct LevelFilter(Arc<AtomicU8>);
+
+impl<S: tracing::Subscriber> Layer<S> for LevelFilter {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let current = self.0.load(Ordering::Relaxed);
+        let msg_level = match *metadata.level() {
+            tracing::Level::TRACE => 0u8,
+            tracing::Level::DEBUG => 1,
+            tracing::Level::INFO => 2,
+            tracing::Level::WARN => 3,
+            tracing::Level::ERROR => 4,
+        };
+        msg_level >= current
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "echat_server=info".into()),
-        )
+    use tracing_subscriber::prelude::*;
+
+    // 共享日志级别（0=trace 1=debug 2=info 3=warn 4=error）
+    let log_level = Arc::new(AtomicU8::new(2));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(LevelFilter(log_level.clone()))
         .init();
+
+    // log_control 闭包：把字符串级别映射为 u8 存入 log_level
+    let ll = log_level.clone();
+    let log_control: state::LogControl = Box::new(move |level: &str| {
+        let v = match level {
+            "trace" => 0u8,
+            "debug" => 1,
+            "info" | "on" => 2,
+            "warn" => 3,
+            "error" | "off" => 4,
+            _ => 2,
+        };
+        ll.store(v, Ordering::Relaxed);
+    });
 
     let config = config::Config::from_env();
     info!(
@@ -34,9 +72,9 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::init_db(&config.db_path).await?;
 
-    // 加载 / 初始化 OP 密码 hash
+    // OP 密码
     let op_password_hash = match db::get_setting(&db, "op_password_hash").await {
-        Some(h) => h,
+        Some(h) => Some(h),
         None => {
             let default_pwd =
                 std::env::var("ECHAT_OP_PASSWORD").unwrap_or_else(|_| "admin123".into());
@@ -46,14 +84,42 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("OP 密码哈希失败: {}", e))?
                 .to_string();
             db::set_setting(&db, "op_password_hash", &hash).await?;
-            info!("首次启动：OP 密码已从环境变量初始化，可用控制台 /Echat password-op 修改");
-            hash
+            info!("首次启动：OP 密码已从环境变量初始化，可用控制台 password-op 修改");
+            Some(hash)
         }
     };
 
-    let state = Arc::new(state::AppState::new(db, config.clone(), op_password_hash));
+    // 接入密码
+    let access_password_hash = db::get_setting(&db, "access_password_hash").await;
+    if access_password_hash.is_none() {
+        info!("服务器当前无接入密码（开放模式），可用控制台 password set [PWD] 设置");
+    } else {
+        info!("服务器已启用接入密码");
+    }
 
-    // 控制台（内部自己起线程 + 独立 runtime）
+    // 联邦密码（三期）
+    let federation_password = db::get_setting(&db, "federation_password").await;
+    if federation_password.is_some() {
+        info!("服务器已启用联邦密码（三期功能，目前仅认证握手可用）");
+    }
+
+    // TLS 开关：从环境变量读证书路径决定
+    let tls_cert = std::env::var("ECHAT_TLS_CERT").ok();
+    let tls_key = std::env::var("ECHAT_TLS_KEY").ok();
+    let tls_enabled = Arc::new(AtomicBool::new(tls_cert.is_some() && tls_key.is_some()));
+
+    let state = Arc::new(state::AppState::new(
+        db,
+        config.clone(),
+        op_password_hash,
+        access_password_hash,
+        federation_password,
+        tls_enabled.clone(),
+        log_level.clone(),
+        log_control,
+    ));
+
+    // 控制台线程
     let console_state = state.clone();
     commands::console::run(console_state);
 
@@ -62,9 +128,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(root))
         .with_state(state);
 
-    let listener = TcpListener::bind(&config.bind).await?;
-    info!("监听已就绪，等待连接...");
-    axum::serve(listener, app).await?;
+    // 可选 TLS
+    if tls_enabled.load(Ordering::Relaxed) {
+        let cert = tls_cert.unwrap();
+        let key = tls_key.unwrap();
+        info!("TLS 已启用 | cert={} key={}", cert, key);
+        let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+        let addr: std::net::SocketAddr = config.bind.parse()?;
+        axum_server::bind_rustls(addr, tls_cfg)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        info!("TLS 未启用（HTTP）。设置 ECHAT_TLS_CERT / ECHAT_TLS_KEY 可启用");
+        let listener = TcpListener::bind(&config.bind).await?;
+        info!("监听已就绪，等待连接...");
+        axum::serve(listener, app).await?;
+    }
+
     Ok(())
 }
 

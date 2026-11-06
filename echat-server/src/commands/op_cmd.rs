@@ -35,6 +35,8 @@ pub async fn handle(
     }
 }
 
+// ==================== OP Login ====================
+
 async fn op_login(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -49,14 +51,21 @@ async fn op_login(
     }
     let (name, password, op_password) = (args[0], args[1], args[2]);
 
-    // 1) 校验 OP 密码
-    let stored_op_hash = state.op_password_hash.read().await.clone();
-    let op_parsed = match PasswordHash::new(&stored_op_hash) {
+    // 1) 校验 OP 密码（二期：Option<String>）
+    let stored = state.op_password_hash.read().await.clone();
+    let op_hash = match stored {
+        Some(h) => h,
+        None => {
+            let _ = tx.send(Outgoing::err(
+                "OP 密码未设置，请联系管理员使用控制台 password-op [PWD] 设置",
+            ));
+            return;
+        }
+    };
+    let op_parsed = match PasswordHash::new(&op_hash) {
         Ok(p) => p,
         Err(_) => {
-            let _ = tx.send(Outgoing::err(
-                "服务端 OP 密码数据损坏，请用控制台 /Echat password-op 重置",
-            ));
+            let _ = tx.send(Outgoing::err("服务端 OP 密码数据损坏"));
             return;
         }
     };
@@ -76,26 +85,25 @@ async fn op_login(
             .await
             .ok()
             .flatten();
-    let hash = match row {
+    let user_hash = match row {
         Some((h,)) => h,
         None => {
             let _ = tx.send(Outgoing::err(format!("用户 {} 不存在", name)));
             return;
         }
     };
-
-    let parsed = match PasswordHash::new(&hash) {
+    let user_parsed = match PasswordHash::new(&user_hash) {
         Ok(p) => p,
         Err(_) => {
-            let _ = tx.send(Outgoing::err("存储的密码数据损坏"));
+            let _ = tx.send(Outgoing::err("存储的用户密码数据损坏"));
             return;
         }
     };
     if Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
+        .verify_password(password.as_bytes(), &user_parsed)
         .is_err()
     {
-        let _ = tx.send(Outgoing::err("密码错误"));
+        let _ = tx.send(Outgoing::err("用户密码错误"));
         return;
     }
 
@@ -107,10 +115,11 @@ async fn op_login(
             return;
         }
     };
-    let mut guard = session.lock().await;
-    guard.is_op = true;
-    guard.user = Some(name.to_string());
-    drop(guard);
+    {
+        let mut guard = session.lock().await;
+        guard.is_op = true;
+        guard.user = Some(name.to_string());
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
     let _ = sqlx::query("INSERT OR IGNORE INTO ops (name, granted_at) VALUES (?, ?)")
@@ -122,6 +131,8 @@ async fn op_login(
     let _ = tx.send(Outgoing::ok(format!("{} 已获得 OP 权限", name)));
 }
 
+// ==================== 权限检查 ====================
+
 async fn require_op(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -130,10 +141,12 @@ async fn require_op(
     let session = get_session(state, session_id).await?;
     let guard = session.lock().await;
     if !guard.is_op {
-        return Err("需要 OP 权限".to_string());
+        return Err("需要 OP 权限（先执行 /Echat OP Login ...）".to_string());
     }
     Ok(user)
 }
+
+// ==================== OP banlist ====================
 
 async fn op_banlist(
     state: &Arc<AppState>,
@@ -156,16 +169,29 @@ async fn op_banlist(
         return;
     }
     let mut msg = format!("封禁列表 ({} 条):\n", rows.len());
-    for (kind, target, reason, _) in rows {
+    let mut items = Vec::new();
+    for (kind, target, reason, at) in rows {
         msg.push_str(&format!(
             "  [{}] {}{}\n",
             kind,
             target,
-            reason.map(|r| format!(" - {}", r)).unwrap_or_default()
+            reason
+                .as_deref()
+                .map(|r| format!(" - {}", r))
+                .unwrap_or_default()
         ));
+        items.push(serde_json::json!({
+            "kind": kind,
+            "target": target,
+            "reason": reason,
+            "banned_at": at,
+        }));
     }
+    let _ = tx.send(Outgoing::data("ban_list", serde_json::json!(items)));
     let _ = tx.send(Outgoing::ok(msg.trim_end().to_string()));
 }
+
+// ==================== OP list ====================
 
 async fn op_list(
     state: &Arc<AppState>,
@@ -194,6 +220,8 @@ async fn op_list(
     let _ = tx.send(Outgoing::data("session_list", serde_json::json!(items)));
     let _ = tx.send(Outgoing::ok(format!("在线会话: {} 个", items.len())));
 }
+
+// ==================== OP kick ====================
 
 async fn op_kick(
     state: &Arc<AppState>,
@@ -226,6 +254,8 @@ async fn op_kick(
     }
 }
 
+// ==================== OP ban ====================
+
 async fn op_ban(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -246,6 +276,12 @@ async fn op_ban(
     } else {
         "被管理员封禁".into()
     };
+
+    if name == "System" || name == "Console" || name == "Global" {
+        let _ = tx.send(Outgoing::err("不能封禁系统保留名称"));
+        return;
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let _ = sqlx::query(
         "INSERT OR REPLACE INTO bans (kind, target, reason, banned_at) VALUES ('name', ?, ?, ?)",
@@ -256,11 +292,14 @@ async fn op_ban(
     .execute(&state.db)
     .await;
 
+    // 在线则立即踢出
     if let Some((sid, _)) = state.find_session_by_user(name).await {
         state.kick(sid, &reason).await;
     }
     let _ = tx.send(Outgoing::ok(format!("已封禁 {}", name)));
 }
+
+// ==================== OP ban-ip ====================
 
 async fn op_ban_ip(
     state: &Arc<AppState>,
@@ -294,6 +333,8 @@ async fn op_ban_ip(
     let _ = tx.send(Outgoing::ok(format!("已封禁 IP {}", ip)));
 }
 
+// ==================== OP pardon ====================
+
 async fn op_pardon(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -322,6 +363,8 @@ async fn op_pardon(
         }
     }
 }
+
+// ==================== OP pardon-ip ====================
 
 async fn op_pardon_ip(
     state: &Arc<AppState>,

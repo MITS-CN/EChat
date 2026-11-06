@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::{get_session, require_user};
@@ -51,8 +52,8 @@ async fn list(
             return;
         }
     };
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT name, ip FROM servers WHERE owner = ? ORDER BY name",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT name, ip, password FROM servers WHERE owner = ? ORDER BY name",
     )
     .bind(&user)
     .fetch_all(&state.db)
@@ -66,9 +67,12 @@ async fn list(
             }
             let mut msg = format!("地址簿 ({} 个):\n", rows.len());
             let mut items = Vec::new();
-            for (n, ip) in rows {
-                msg.push_str(&format!("  {}  ->  {}\n", n, ip));
-                items.push(serde_json::json!({"name": n, "ip": ip}));
+            for (n, ip, pwd) in rows {
+                let lock = if pwd.is_some() { " 🔒" } else { "" };
+                msg.push_str(&format!("  {}  ->  {}{}\n", n, ip, lock));
+                items.push(serde_json::json!({
+                    "name": n, "ip": ip, "has_password": pwd.is_some()
+                }));
             }
             let _ = tx.send(Outgoing::data("server_list", serde_json::json!(items)));
             let _ = tx.send(Outgoing::ok(msg.trim_end().to_string()));
@@ -86,10 +90,14 @@ async fn add(
     tx: &mpsc::UnboundedSender<Outgoing>,
 ) {
     if args.len() < 2 {
-        let _ = tx.send(Outgoing::err("用法: /Echat server add [IP] [NAME]"));
+        let _ = tx.send(Outgoing::err(
+            "用法: /Echat server add [IP] [NAME] [PASSWORD（可选）]",
+        ));
         return;
     }
     let (ip, name) = (args[0], args[1]);
+    let password = args.get(2).copied();
+
     let user = match require_user(state, session_id).await {
         Ok(u) => u,
         Err(e) => {
@@ -112,16 +120,23 @@ async fn add(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    match sqlx::query("INSERT INTO servers (owner, name, ip, created_at) VALUES (?, ?, ?, ?)")
-        .bind(&user)
-        .bind(name)
-        .bind(ip)
-        .bind(&now)
-        .execute(&state.db)
-        .await
+    match sqlx::query(
+        "INSERT INTO servers (owner, name, ip, password, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&user)
+    .bind(name)
+    .bind(ip)
+    .bind(password)
+    .bind(&now)
+    .execute(&state.db)
+    .await
     {
         Ok(_) => {
-            let _ = tx.send(Outgoing::ok(format!("已添加服务器 {} -> {}", name, ip)));
+            let lock = if password.is_some() { "（已设置接入密码）" } else { "" };
+            let _ = tx.send(Outgoing::ok(format!(
+                "已添加服务器 {} -> {}{}",
+                name, ip, lock
+            )));
         }
         Err(e) => {
             let _ = tx.send(Outgoing::err(format!("添加失败: {}", e)));
@@ -155,25 +170,52 @@ async fn test(
         }
     };
 
-    let addr = parse_host_port(&ip);
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await;
+    let url = format!("ws://{}/echat", ip);
+    let hello = match tokio::time::timeout(Duration::from_secs(5), connect_async(&url)).await {
+        Ok(Ok((ws, _))) => {
+            let (_, mut read) = ws.split();
+            match tokio::time::timeout(Duration::from_secs(3), read.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => Some(t),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
 
-    match result {
-        Ok(Ok(_)) => {
-            let _ = tx.send(Outgoing::ok(format!(
-                "服务器 {} ({}) 可达，加密状态: 待二期实现",
+    match hello {
+        Some(text) => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v.get("type").and_then(|x| x.as_str()) == Some("hello_ack") {
+                    let encrypted = v
+                        .get("encrypted")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let server_name = v
+                        .get("server_name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?");
+                    let needs_auth = v
+                        .get("needs_auth")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let _ = tx.send(Outgoing::ok(format!(
+                        "服务器 {} ({}) 可达\n  真实名称: {}\n  加密: {}\n  需要接入密码: {}",
+                        name,
+                        ip,
+                        server_name,
+                        if encrypted { "✅ 是 (TLS)" } else { "❌ 否" },
+                        if needs_auth { "是" } else { "否" }
+                    )));
+                    return;
+                }
+            }
+            let _ = tx.send(Outgoing::err("对方服务器响应格式异常"));
+        }
+        None => {
+            let _ = tx.send(Outgoing::err(format!(
+                "无法连接 {} ({})，请检查地址或对方是否启用了 wss（TLS-only）",
                 name, ip
             )));
-        }
-        Ok(Err(e)) => {
-            let _ = tx.send(Outgoing::err(format!("服务器 {} 不可达: {}", name, e)));
-        }
-        Err(_) => {
-            let _ = tx.send(Outgoing::err(format!("服务器 {} 连接超时", name)));
         }
     }
 }
@@ -233,7 +275,7 @@ async fn contact(
             return;
         }
     };
-    let (name, ip) = match resolve_server(state, &user, target).await {
+    let (name, ip, password) = match resolve_server_full(state, &user, target).await {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(Outgoing::err(e));
@@ -256,61 +298,137 @@ async fn contact(
         }
     }
 
+    match do_contact(state, session_id, &name, &ip, password.as_deref()).await {
+        Ok(()) => {
+            let _ = tx.send(Outgoing::ok(format!("已连接到服务器 {} ({})", name, ip)));
+        }
+        Err(e) => {
+            let _ = tx.send(Outgoing::err(e));
+        }
+    }
+}
+
+async fn do_contact(
+    state: &Arc<AppState>,
+    session_id: Uuid,
+    name: &str,
+    ip: &str,
+    password: Option<&str>,
+) -> Result<(), String> {
     let url = if ip.starts_with("ws://") || ip.starts_with("wss://") {
-        ip.clone()
+        ip.to_string()
     } else {
         format!("ws://{}/echat", ip)
     };
 
-    match tokio::time::timeout(Duration::from_secs(5), connect_async(&url)).await {
-        Ok(Ok((ws_stream, _))) => {
-            let (_, mut read) = ws_stream.split();
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let cancel_bg = cancel.clone();
-            let sid = session_id;
-            let state_bg = state.clone();
-            let name_bg = name.clone();
+    let ws = tokio::time::timeout(Duration::from_secs(5), connect_async(&url))
+        .await
+        .map_err(|_| format!("连接 {} 超时", name))?
+        .map_err(|e| format!("连接 {} 失败: {}", name, e))?
+        .0;
 
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel_bg.cancelled() => break,
-                        msg = read.next() => {
-                            match msg {
-                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
-                                    let content = extract_event_content(&t)
-                                        .unwrap_or_else(|| t.to_string());
-                                    state_bg
-                                        .send_to(sid, Outgoing::event(&name_bg, content))
-                                        .await;
-                                }
-                                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
-                                | None
-                                | Some(Err(_)) => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            });
+    let (mut sink, mut stream) = ws.split();
 
-            let session = state.sessions.get(&session_id).unwrap().clone();
-            let mut guard = session.lock().await;
-            guard.connected.insert(
-                name.clone(),
-                ConnectedServer { ip: ip.clone(), cancel },
-            );
-            drop(guard);
+    // 读 hello_ack
+    let hello_text = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .map_err(|_| "读取握手超时".to_string())?
+        .ok_or_else(|| "对方关闭连接".to_string())?
+        .map_err(|e| format!("握手错误: {}", e))?;
 
-            let _ = tx.send(Outgoing::ok(format!("已连接到服务器 {} ({})", name, ip)));
-        }
-        Ok(Err(e)) => {
-            let _ = tx.send(Outgoing::err(format!("连接 {} 失败: {}", name, e)));
-        }
-        Err(_) => {
-            let _ = tx.send(Outgoing::err(format!("连接 {} 超时", name)));
+    let hello: serde_json::Value = match hello_text {
+        Message::Text(t) => serde_json::from_str(&t).map_err(|e| format!("握手格式错误: {}", e))?,
+        _ => return Err("握手首帧不是文本".into()),
+    };
+
+    if hello.get("type").and_then(|x| x.as_str()) != Some("hello_ack") {
+        return Err("对方服务器响应格式异常".into());
+    }
+
+    let needs_auth = hello
+        .get("needs_auth")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+
+    if needs_auth {
+        let Some(pwd) = password else {
+            return Err(format!(
+                "服务器 {} 需要接入密码，请先 /Echat server del {} 再带密码重新 add",
+                name, name
+            ));
+        };
+        let auth_msg = serde_json::json!({"type":"auth","password":pwd}).to_string();
+        sink.send(Message::Text(auth_msg))
+            .await
+            .map_err(|e| format!("发送认证失败: {}", e))?;
+
+        let result_text = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .map_err(|_| "等待认证结果超时".to_string())?
+            .ok_or_else(|| "对方关闭连接".to_string())?
+            .map_err(|e| format!("读取认证结果失败: {}", e))?;
+
+        let result: serde_json::Value = match result_text {
+            Message::Text(t) => serde_json::from_str(&t)
+                .map_err(|e| format!("认证结果格式错误: {}", e))?,
+            _ => return Err("认证结果不是文本".into()),
+        };
+
+        let ok = result
+            .get("data")
+            .and_then(|d| d.get("ok"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!("接入密码被 {} 拒绝", name));
         }
     }
+
+    // 后台任务：持续读取对方广播
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_bg = cancel.clone();
+    let sid = session_id;
+    let state_bg = state.clone();
+    let name_bg = name.to_string();
+    tokio::spawn(async move {
+        let _sink = sink; // 保活
+        loop {
+            tokio::select! {
+                _ = cancel_bg.cancelled() => break,
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(t))) => {
+                            let content = extract_event_content(&t)
+                                .unwrap_or_else(|| t.to_string());
+                            state_bg
+                                .send_to(sid, Outgoing::event(&name_bg, content))
+                                .await;
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    // 记录连接
+    let sess_arc = {
+        let entry = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| "会话丢失".to_string())?;
+        let s = entry.value().clone();
+        drop(entry);
+        s
+    };
+    let mut guard = sess_arc.lock().await;
+    guard.connected.insert(
+        name.to_string(),
+        ConnectedServer { ip: ip.to_string(), cancel },
+    );
+
+    Ok(())
 }
 
 async fn contact_all(
@@ -325,8 +443,8 @@ async fn contact_all(
             return;
         }
     };
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT name, ip FROM servers WHERE owner = ? ORDER BY name",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT name, ip, password FROM servers WHERE owner = ? ORDER BY name",
     )
     .bind(&user)
     .fetch_all(&state.db)
@@ -340,79 +458,27 @@ async fn contact_all(
 
     let mut ok_count = 0;
     let mut fail_count = 0;
-    for (name, ip) in rows {
+    for (name, ip, pwd) in rows {
         let already = {
-            let session = state.sessions.get(&session_id).unwrap().clone();
-            let guard = session.lock().await;
+            let entry = state.sessions.get(&session_id).unwrap();
+            let sess = entry.value().clone();
+            drop(entry);
+            let guard = sess.lock().await;
             guard.connected.contains_key(&name)
         };
         if already {
             ok_count += 1;
             continue;
         }
-        let ok = try_contact_one(state, session_id, &name, &ip).await;
-        if ok {
-            ok_count += 1;
-        } else {
-            fail_count += 1;
+        match do_contact(state, session_id, &name, &ip, pwd.as_deref()).await {
+            Ok(()) => ok_count += 1,
+            Err(_) => fail_count += 1,
         }
     }
     let _ = tx.send(Outgoing::ok(format!(
         "contact-all 完成：成功 {} / 失败 {}",
         ok_count, fail_count
     )));
-}
-
-async fn try_contact_one(
-    state: &Arc<AppState>,
-    session_id: Uuid,
-    name: &str,
-    ip: &str,
-) -> bool {
-    let url = if ip.starts_with("ws://") || ip.starts_with("wss://") {
-        ip.to_string()
-    } else {
-        format!("ws://{}/echat", ip)
-    };
-    match tokio::time::timeout(Duration::from_secs(3), connect_async(&url)).await {
-        Ok(Ok((ws_stream, _))) => {
-            let (_, mut read) = ws_stream.split();
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let cancel_bg = cancel.clone();
-            let sid = session_id;
-            let state_bg = state.clone();
-            let name_bg = name.to_string();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel_bg.cancelled() => break,
-                        msg = read.next() => {
-                            match msg {
-                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
-                                    let content = extract_event_content(&t)
-                                        .unwrap_or_else(|| t.to_string());
-                                    state_bg
-                                        .send_to(sid, Outgoing::event(&name_bg, content))
-                                        .await;
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
-                }
-            });
-            if let Some(sess) = state.sessions.get(&session_id) {
-                let sess = sess.clone();
-                let mut guard = sess.lock().await;
-                guard.connected.insert(
-                    name.to_string(),
-                    ConnectedServer { ip: ip.to_string(), cancel },
-                );
-            }
-            true
-        }
-        _ => false,
-    }
 }
 
 async fn uncontact(
@@ -499,42 +565,48 @@ async fn contact_list(
     let _ = tx.send(Outgoing::ok(msg.trim_end().to_string()));
 }
 
+/// 一期兼容：仅名字/IP，返回 (name, ip)
 async fn resolve_server(
     state: &AppState,
     user: &str,
     target: &str,
 ) -> Result<(String, String), String> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT name, ip FROM servers WHERE owner = ? AND name = ?")
-            .bind(user)
-            .bind(target)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-    if let Some((n, ip)) = row {
-        return Ok((n, ip));
-    }
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT name, ip FROM servers WHERE owner = ? AND ip = ?")
-            .bind(user)
-            .bind(target)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-    if let Some((n, ip)) = row {
-        return Ok((n, ip));
-    }
-    if target.contains(':') || target.contains('.') {
-        return Ok((target.to_string(), target.to_string()));
-    }
-    Err(format!("找不到服务器 {}", target))
+    let (n, ip, _) = resolve_server_full(state, user, target).await?;
+    Ok((n, ip))
 }
 
-fn parse_host_port(ip: &str) -> String {
-    let s = ip
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://");
-    s.split('/').next().unwrap_or(s).to_string()
+/// 二期：返回 (name, ip, password)
+async fn resolve_server_full(
+    state: &AppState,
+    user: &str,
+    target: &str,
+) -> Result<(String, String, Option<String>), String> {
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT name, ip, password FROM servers WHERE owner = ? AND name = ?",
+    )
+    .bind(user)
+    .bind(target)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(v) = row {
+        return Ok(v);
+    }
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT name, ip, password FROM servers WHERE owner = ? AND ip = ?",
+    )
+    .bind(user)
+    .bind(target)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(v) = row {
+        return Ok(v);
+    }
+    if target.contains(':') || target.contains('.') {
+        return Ok((target.to_string(), target.to_string(), None));
+    }
+    Err(format!("找不到服务器 {}", target))
 }
 
 fn extract_event_content(raw: &str) -> Option<String> {

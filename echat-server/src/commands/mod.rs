@@ -2,6 +2,7 @@ pub mod console;
 pub mod op_cmd;
 pub mod say;
 pub mod server_cmd;
+pub mod tell;
 pub mod user_cmd;
 
 use std::sync::Arc;
@@ -65,7 +66,7 @@ pub async fn dispatch(
     }
     if tokens.len() < 2 {
         let _ = tx.send(Outgoing::err(
-            "用法: /Echat <server|user|say|OP> ...".to_string(),
+            "用法: /Echat <server|user|say|tell|OP> ...".to_string(),
         ));
         return;
     }
@@ -74,6 +75,7 @@ pub async fn dispatch(
         "server" => server_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         "user" => user_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         "say" => say::handle(&state, session_id, &tokens[2..], tx).await,
+        "tell" => tell::handle(&state, session_id, &tokens[2..], tx).await,
         "op" => op_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         other => {
             let _ = tx.send(Outgoing::err(format!("未知命令类别: {}", other)));

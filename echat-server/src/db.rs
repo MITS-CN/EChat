@@ -31,6 +31,7 @@ pub async fn init_db(path: &str) -> anyhow::Result<SqlitePool> {
             owner      TEXT NOT NULL,
             name       TEXT NOT NULL,
             ip         TEXT NOT NULL,
+            password   TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY (owner, name)
         );
@@ -38,6 +39,16 @@ pub async fn init_db(path: &str) -> anyhow::Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+
+    let cols: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM pragma_table_info('servers')")
+            .fetch_all(&pool)
+            .await?;
+    if !cols.iter().any(|(n,)| n == "password") {
+        sqlx::query("ALTER TABLE servers ADD COLUMN password TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     sqlx::query(
         r#"
@@ -95,4 +106,18 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> anyhow::R
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub async fn del_setting(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// 兼容别名
+#[allow(dead_code)]
+pub async fn delete_setting(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
+    del_setting(pool, key).await
 }
