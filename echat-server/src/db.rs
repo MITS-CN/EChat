@@ -119,6 +119,72 @@ pub async fn init_db(path: &str) -> anyhow::Result<SqlitePool> {
     "#,
     ).execute(&pool).await?;
 
+    // ===== 三期 B：群聊新增 =====
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS groups (
+            uuid        TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            owner       TEXT NOT NULL,
+            intro       TEXT DEFAULT '',
+            join_mode   TEXT NOT NULL DEFAULT 'A',
+            searchable  INTEGER NOT NULL DEFAULT 1,
+            question    TEXT,
+            answer_hash TEXT,
+            created_at  TEXT NOT NULL
+        );
+    "#,
+    ).execute(&pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_groups_name ON groups(name)")
+        .execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_uuid TEXT NOT NULL,
+            user       TEXT NOT NULL,
+            role       TEXT NOT NULL DEFAULT 'member',
+            joined_at  TEXT NOT NULL,
+            PRIMARY KEY (group_uuid, user)
+        );
+    "#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS group_invites (
+            group_uuid TEXT NOT NULL,
+            user       TEXT NOT NULL,
+            from_user  TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (group_uuid, user)
+        );
+    "#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS group_join_requests (
+            group_uuid TEXT NOT NULL,
+            user       TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (group_uuid, user)
+        );
+    "#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS group_join_attempts (
+            group_uuid TEXT NOT NULL,
+            user       TEXT NOT NULL,
+            answer     TEXT NOT NULL,
+            success    INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+    "#,
+    ).execute(&pool).await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS messages (

@@ -75,6 +75,7 @@ async fn handle(state: &Arc<AppState>, line: &str) {
         "password-op-reset" => c_password_op_reset(state).await,
         "federation-password" => c_federation_password(state, rest).await,
         "friends" => c_friends(state, rest).await,
+        "grups" | "groups" => c_grups(state, rest).await,
         "log" => c_log(state, rest).await,
         "exit" => { println!("正在关闭服务器..."); std::process::exit(0); }
         "say" => {
@@ -101,6 +102,8 @@ fn print_help() {
   op <名称>                     授予在线用户 OP 权限
   friends del [A] to [B]       强制解除好友关系
   friends get [A] to [B] Limit [N]  查看好友聊天记录
+  grups del [UUID]             强制解散群聊
+  grups get [UUID] Limit [N]   查看群聊聊天记录
   say <消息>                    广播消息
   password set [PWD]           设置接入密码（首次）
   password reset [PWD]         重设接入密码（不影响已有连接）
@@ -417,5 +420,45 @@ async fn c_log(state: &Arc<AppState>, args: &[&str]) {
             println!("日志级别已切换为: {}", effective);
         }
         other => println!("未知日志级别: {}（可选 on/off/trace/debug/info/warn/error）", other),
+    }
+}
+
+async fn c_grups(state: &Arc<AppState>, args: &[&str]) {
+    if args.is_empty() { println!("用法: grups <del|get> [UUID] ..."); return; }
+    match args[0].to_lowercase().as_str() {
+        "del" => {
+            if args.len() < 2 { println!("用法: grups del [UUID]"); return; }
+            let uuid = args[1];
+            let g: Option<(String,)> = sqlx::query_as("SELECT name FROM groups WHERE uuid = ?").bind(uuid).fetch_optional(&state.db).await.ok().flatten();
+            if g.is_none() { println!("群不存在"); return; }
+            let g_name = g.unwrap().0;
+            
+            let _ = sqlx::query("DELETE FROM groups WHERE uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_members WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_invites WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_join_requests WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM messages WHERE kind='group' AND target = ?").bind(uuid).execute(&state.db).await;
+            
+            println!("群 {} 已被解散", g_name);
+            let _ = state.broadcast_filtered(MsgKind::Force, "Notify:System", &format!("群聊 {} 已被管理员解散", g_name)).await;
+        }
+        "get" => {
+            if args.len() < 5 || !args[2].eq_ignore_ascii_case("limit") { println!("用法: grups get [UUID] Limit [行数]"); return; }
+            let uuid = args[1];
+            let limit: usize = match args[3].parse() { Ok(n) if n > 0 && n <= 5000 => n, _ => { println!("行数必须 1-5000"); return; } };
+            
+            let g: Option<(String,)> = sqlx::query_as("SELECT name FROM groups WHERE uuid = ?").bind(uuid).fetch_optional(&state.db).await.ok().flatten();
+            if g.is_none() { println!("群不存在"); return; }
+            
+            let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+                "SELECT id, from_user, content, created_at FROM messages WHERE kind='group' AND target=? ORDER BY id DESC LIMIT ?"
+            ).bind(uuid).bind(limit as i64).fetch_all(&state.db).await.unwrap_or_default();
+            
+            println!("群 {} 最近 {} 条消息:", g.unwrap().0, rows.len());
+            for (_, from, content, at) in rows.into_iter().rev() {
+                println!("  [{}] <{}> {}", at, from, content);
+            }
+        }
+        _ => println!("未知 grups 子命令"),
     }
 }

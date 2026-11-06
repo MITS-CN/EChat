@@ -16,7 +16,7 @@ pub async fn handle(
 ) {
     if args.is_empty() {
         let _ = tx.send(Outgoing::err(
-            "用法: /Echat OP <Login|banlist|list|kick|ban|ban-ip|pardon|pardon-ip|friends> ..."
+            "用法: /Echat OP <Login|banlist|list|kick|ban|ban-ip|pardon|pardon-ip|friends|grups> ..."
         ));
         return;
     }
@@ -30,6 +30,7 @@ pub async fn handle(
         "pardon" => op_pardon(state, session_id, &args[1..], tx).await,
         "pardon-ip" => op_pardon_ip(state, session_id, &args[1..], tx).await,
         "friends" => op_friends(state, session_id, &args[1..], tx).await,
+        "grups" | "groups" => op_grups(state, session_id, &args[1..], tx).await,
         other => { let _ = tx.send(Outgoing::err(format!("未知 OP 子命令: {}", other))); }
     }
 }
@@ -319,10 +320,7 @@ async fn op_friends(
                 Ok(n) if n > 0 => n,
                 _ => { let _ = tx.send(Outgoing::err("Limit 必须是正整数")); return; }
             };
-            if limit > 5000 {
-                let _ = tx.send(Outgoing::err("Limit 不能超过 5000"));
-                return;
-            }
+            if limit > 5000 { let _ = tx.send(Outgoing::err("Limit 不能超过 5000")); return; }
             let pair = normalize_friend_target(&a, &b);
             let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
                 "SELECT id, from_user, content, created_at FROM messages \
@@ -340,5 +338,53 @@ async fn op_friends(
             let _ = tx.send(Outgoing::ok(format!("返回 {} 和 {} 最近 {} 条消息", a, b, items.len())));
         }
         other => { let _ = tx.send(Outgoing::err(format!("未知 OP friends 子命令: {}", other))); }
+    }
+}
+
+async fn op_grups(
+    state: &Arc<AppState>,
+    session_id: Uuid,
+    args: &[&str],
+    tx: &mpsc::UnboundedSender<Outgoing>,
+) {
+    if args.is_empty() { let _ = tx.send(Outgoing::err("用法: /Echat op grups <del|get> [UUID] ...")); return; }
+    if let Err(e) = require_op(state, session_id).await { let _ = tx.send(Outgoing::err(e)); return; }
+    
+    match args[0].to_lowercase().as_str() {
+        "del" => {
+            if args.len() < 2 { let _ = tx.send(Outgoing::err("用法: op grups del [UUID]")); return; }
+            let uuid = args[1];
+            let g: Option<(String,)> = sqlx::query_as("SELECT name FROM groups WHERE uuid = ?").bind(uuid).fetch_optional(&state.db).await.ok().flatten();
+            if g.is_none() { let _ = tx.send(Outgoing::err("群不存在")); return; }
+            let g_name = g.unwrap().0;
+            
+            let _ = sqlx::query("DELETE FROM groups WHERE uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_members WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_invites WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM group_join_requests WHERE group_uuid = ?").bind(uuid).execute(&state.db).await;
+            let _ = sqlx::query("DELETE FROM messages WHERE kind='group' AND target = ?").bind(uuid).execute(&state.db).await;
+            
+            let _ = tx.send(Outgoing::ok(format!("群 {} 已被解散", g_name)));
+            let _ = state.broadcast_filtered(MsgKind::Force, "Notify:System", &format!("群聊 {} 已被管理员解散", g_name)).await;
+        }
+        "get" => {
+            if args.len() < 5 || !args[2].eq_ignore_ascii_case("limit") { let _ = tx.send(Outgoing::err("用法: op grups get [UUID] Limit [行数]")); return; }
+            let uuid = args[1];
+            let limit: usize = match args[3].parse() { Ok(n) if n > 0 && n <= 5000 => n, _ => { let _ = tx.send(Outgoing::err("行数必须 1-5000")); return; } };
+            
+            let g: Option<(String,)> = sqlx::query_as("SELECT name FROM groups WHERE uuid = ?").bind(uuid).fetch_optional(&state.db).await.ok().flatten();
+            if g.is_none() { let _ = tx.send(Outgoing::err("群不存在")); return; }
+            
+            let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+                "SELECT id, from_user, content, created_at FROM messages WHERE kind='group' AND target=? ORDER BY id DESC LIMIT ?"
+            ).bind(uuid).bind(limit as i64).fetch_all(&state.db).await.unwrap_or_default();
+            
+            let mut items = Vec::new();
+            for (id, from, content, at) in rows { items.push(serde_json::json!({"id": id, "from": from, "content": content, "at": at})); }
+            items.reverse();
+            let _ = tx.send(Outgoing::data("group_messages", serde_json::json!({"messages": items})));
+            let _ = tx.send(Outgoing::ok(format!("返回群 {} 最近 {} 条消息", g.unwrap().0, items.len())));
+        }
+        _ => { let _ = tx.send(Outgoing::err("未知 op grups 子命令")); }
     }
 }

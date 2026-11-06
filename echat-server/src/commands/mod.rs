@@ -2,6 +2,7 @@ pub mod console;
 pub mod friend_cmd;
 pub mod op_cmd;
 pub mod say;
+pub mod group_cmd;
 pub mod server_cmd;
 pub mod show_cmd;
 pub mod tell;
@@ -182,17 +183,23 @@ pub async fn dispatch(
         }
     }
 
+
     match tokens[1].to_lowercase().as_str() {
-        "help" => print_help(tx),
+
         "server" => server_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         "user" => user_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         "say" => say::handle(&state, session_id, &tokens[2..], tx).await,
         "tell" => tell::handle(&state, session_id, &tokens[2..], tx).await,
-        "online" | "onile" => friend_cmd::handle(&state, session_id, &tokens[2..], tx).await,
+        "gsay" => group_cmd::handle_gsay(&state, session_id, &tokens[2..], tx).await, 
+        "online" | "onile" => {
+            if tokens.len() > 2 && (tokens[2].eq_ignore_ascii_case("groups") || tokens[2].eq_ignore_ascii_case("grups")) {
+                group_cmd::handle(&state, session_id, &tokens[3..], tx).await;
+            } else {
+                friend_cmd::handle(&state, session_id, &tokens[2..], tx).await;
+            }
+        }
         "show" => show_cmd::handle(&state, session_id, &tokens[2..], tx).await,
         "op" => op_cmd::handle(&state, session_id, &tokens[2..], tx).await,
-        other => {
-            let _ = tx.send(Outgoing::err(format!("未知命令类别: {}", other)));
-        }
+        other => { let _ = tx.send(Outgoing::err(format!("未知命令类别: {}", other))); }
     }
 }

@@ -14,11 +14,11 @@ pub async fn handle(
     tx: &mpsc::UnboundedSender<Outgoing>,
 ) {
     if args.is_empty() {
-        let _ = tx.send(Outgoing::err("用法: /Echat show <ALL|LAN|friends [NAME]>"));
+        let _ = tx.send(Outgoing::err("用法: /Echat show <ALL|LAN|friends [NAME]|groups [群标识]>"));
         return;
     }
-    let _ = match require_user(state, session_id).await {
-        Ok(_) => {}
+    let me = match require_user(state, session_id).await {
+        Ok(u) => u,
         Err(e) => { let _ = tx.send(Outgoing::err(e)); return; }
     };
 
@@ -30,10 +30,6 @@ pub async fn handle(
                 let _ = tx.send(Outgoing::err("用法: /Echat show friends [NAME]"));
                 return;
             }
-            let me = match require_user(state, session_id).await {
-                Ok(u) => u,
-                Err(e) => { let _ = tx.send(Outgoing::err(e)); return; }
-            };
             let target = match resolve_user_name(&state.db, args[1]).await {
                 Some(n) => n,
                 None => {
@@ -52,7 +48,44 @@ pub async fn handle(
             set_filter(state, session_id, ShowFilter::Friends(target), tx).await
         }
         "groups" | "grups" => {
-            let _ = tx.send(Outgoing::err("群聊显示过滤在三期 B 实现"));
+            if args.len() < 2 {
+                let _ = tx.send(Outgoing::err("用法: /Echat show groups [群标识]"));
+                return;
+            }
+            let input = args[1];
+            // 内联解析群标识
+            let uuid_res: Option<(String, String)> = if input.contains('#') {
+                let parts: Vec<&str> = input.split('#').collect();
+                if parts.len() != 2 { None } else {
+                    sqlx::query_as("SELECT uuid, name FROM groups WHERE name = ? AND substr(replace(uuid, '-', ''), 1, 6) = ?")
+                        .bind(parts[0]).bind(parts[1]).fetch_optional(&state.db).await.ok().flatten()
+                }
+            } else if input.len() == 36 && input.contains('-') {
+                sqlx::query_as("SELECT uuid, name FROM groups WHERE uuid = ?")
+                    .bind(input).fetch_optional(&state.db).await.ok().flatten()
+            } else if input.len() == 6 && !input.contains('-') {
+                sqlx::query_as("SELECT uuid, name FROM groups WHERE substr(replace(uuid, '-', ''), 1, 6) = ?")
+                    .bind(input).fetch_optional(&state.db).await.ok().flatten()
+            } else {
+                sqlx::query_as("SELECT uuid, name FROM groups WHERE name = ? LIMIT 1")
+                    .bind(input).fetch_optional(&state.db).await.ok().flatten()
+            };
+
+            let (uuid, name) = match uuid_res {
+                Some(r) => r,
+                None => { let _ = tx.send(Outgoing::err("找不到该群")); return; }
+            };
+
+            // 检查是否在群内
+            let role: Option<(String,)> = sqlx::query_as(
+                "SELECT role FROM group_members WHERE group_uuid = ? AND user = ?"
+            ).bind(&uuid).bind(&me).fetch_optional(&state.db).await.ok().flatten();
+
+            if role.is_none() {
+                let _ = tx.send(Outgoing::err("你不在该群中，无法过滤"));
+                return;
+            }
+            set_filter(state, session_id, ShowFilter::Groups(name), tx).await
         }
         other => {
             let _ = tx.send(Outgoing::err(format!("未知 show 选项: {}", other)));
