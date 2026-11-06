@@ -49,11 +49,26 @@ async fn op_login(
     }
     let (name, password, op_password) = (args[0], args[1], args[2]);
 
-    if op_password != state.config.op_password {
+    // 1) 校验 OP 密码
+    let stored_op_hash = state.op_password_hash.read().await.clone();
+    let op_parsed = match PasswordHash::new(&stored_op_hash) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = tx.send(Outgoing::err(
+                "服务端 OP 密码数据损坏，请用控制台 /Echat password-op 重置",
+            ));
+            return;
+        }
+    };
+    if Argon2::default()
+        .verify_password(op_password.as_bytes(), &op_parsed)
+        .is_err()
+    {
         let _ = tx.send(Outgoing::err("OP 密码错误"));
         return;
     }
 
+    // 2) 校验用户密码
     let row: Option<(String,)> =
         sqlx::query_as("SELECT password_hash FROM users WHERE name = ?")
             .bind(name)
@@ -84,6 +99,7 @@ async fn op_login(
         return;
     }
 
+    // 3) 授予 OP
     let session = match get_session(state, session_id).await {
         Ok(s) => s,
         Err(e) => {

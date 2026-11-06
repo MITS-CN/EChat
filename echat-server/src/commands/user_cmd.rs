@@ -6,7 +6,7 @@ use argon2::{Argon2, PasswordHasher};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{get_session, require_user};
+use super::get_session;
 use crate::protocol::Outgoing;
 use crate::session::RegState;
 use crate::state::AppState;
@@ -58,7 +58,6 @@ async fn reg_name(
     let name = args[0];
     let target = args[1];
 
-    // 名称规则：字母、数字、下划线
     if name.is_empty()
         || !name
             .chars()
@@ -68,7 +67,6 @@ async fn reg_name(
         return;
     }
 
-    // 一期只支持当前服务端
     if !is_current_server(state, target) {
         let _ = tx.send(Outgoing::err(format!(
             "一期仅支持在当前服务端注册，[NAME/IP] 需为 '{}' 或当前服务端地址",
@@ -164,7 +162,6 @@ async fn reg_password(
         }
     }
 
-    // Argon2 哈希
     let salt = SaltString::generate(&mut OsRng);
     let hash = match Argon2::default().hash_password(pwd.as_bytes(), &salt) {
         Ok(h) => h.to_string(),
@@ -192,7 +189,6 @@ async fn reg_password(
                 "注册成功，欢迎 {}！现在可以使用 Echat 全部功能",
                 name
             )));
-            // 向所有人广播上线
             let announce = format!("{} 已上线", name);
             state.broadcast("System", &announce).await;
         }
@@ -207,10 +203,4 @@ fn is_current_server(state: &Arc<AppState>, target: &str) -> bool {
         || target.contains(&state.config.bind.split(':').next().unwrap_or(""))
         || target == "127.0.0.1"
         || target == "localhost"
-}
-
-// 让编译器别抱怨未使用
-#[allow(dead_code)]
-async fn _unused(state: &Arc<AppState>, session_id: Uuid) {
-    let _ = require_user(state, session_id).await;
 }

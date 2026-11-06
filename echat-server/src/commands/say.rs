@@ -20,7 +20,6 @@ pub async fn handle(
     say_text(state.clone(), session_id, &text).await;
 }
 
-/// 直接广播文本（也会用于非斜杠开头的裸聊天）
 pub async fn say_text(state: Arc<AppState>, session_id: Uuid, text: &str) {
     let user = match require_user(&state, session_id).await {
         Ok(u) => u,

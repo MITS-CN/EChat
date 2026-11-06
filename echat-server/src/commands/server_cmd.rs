@@ -241,7 +241,6 @@ async fn contact(
         }
     };
 
-    // 已连接？
     {
         let session = match get_session(state, session_id).await {
             Ok(s) => s,
@@ -299,7 +298,7 @@ async fn contact(
             let mut guard = session.lock().await;
             guard.connected.insert(
                 name.clone(),
-                ConnectedServer { name: name.clone(), ip: ip.clone(), cancel },
+                ConnectedServer { ip: ip.clone(), cancel },
             );
             drop(guard);
 
@@ -351,7 +350,6 @@ async fn contact_all(
             ok_count += 1;
             continue;
         }
-        // 逐个连接，保持简单
         let ok = try_contact_one(state, session_id, &name, &ip).await;
         if ok {
             ok_count += 1;
@@ -408,7 +406,7 @@ async fn try_contact_one(
                 let mut guard = sess.lock().await;
                 guard.connected.insert(
                     name.to_string(),
-                    ConnectedServer { name: name.to_string(), ip: ip.to_string(), cancel },
+                    ConnectedServer { ip: ip.to_string(), cancel },
                 );
             }
             true
@@ -436,7 +434,6 @@ async fn uncontact(
         }
     };
     let mut guard = session.lock().await;
-    // 匹配名字或 ip
     let key = guard
         .connected
         .iter()
@@ -502,13 +499,11 @@ async fn contact_list(
     let _ = tx.send(Outgoing::ok(msg.trim_end().to_string()));
 }
 
-/// 解析 target 是名字还是 IP，返回 (name, ip)
 async fn resolve_server(
     state: &AppState,
     user: &str,
     target: &str,
 ) -> Result<(String, String), String> {
-    // 按名字
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT name, ip FROM servers WHERE owner = ? AND name = ?")
             .bind(user)
@@ -519,7 +514,6 @@ async fn resolve_server(
     if let Some((n, ip)) = row {
         return Ok((n, ip));
     }
-    // 按 IP
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT name, ip FROM servers WHERE owner = ? AND ip = ?")
             .bind(user)
@@ -530,7 +524,6 @@ async fn resolve_server(
     if let Some((n, ip)) = row {
         return Ok((n, ip));
     }
-    // 直接给 IP
     if target.contains(':') || target.contains('.') {
         return Ok((target.to_string(), target.to_string()));
     }
@@ -538,11 +531,9 @@ async fn resolve_server(
 }
 
 fn parse_host_port(ip: &str) -> String {
-    // 去重 ws/wss 前缀
     let s = ip
         .trim_start_matches("ws://")
         .trim_start_matches("wss://");
-    // 去掉路径
     s.split('/').next().unwrap_or(s).to_string()
 }
 

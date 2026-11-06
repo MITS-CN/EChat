@@ -25,7 +25,6 @@ pub enum RegState {
 }
 
 pub struct ConnectedServer {
-    pub name: String,
     pub ip: String,
     pub cancel: CancellationToken,
 }
@@ -56,7 +55,6 @@ pub async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 
     tracing::info!("新连接 {} 已建立", session_id);
 
-    // 发送任务：从 channel 读取消息推给 WebSocket
     let ct_out = close_token.clone();
     let out_task = tokio::spawn(async move {
         loop {
@@ -86,7 +84,6 @@ pub async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    // 接收循环
     let ct_in = close_token.clone();
     loop {
         tokio::select! {

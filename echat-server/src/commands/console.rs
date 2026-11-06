@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::SaltString;
+use argon2::{Argon2, PasswordHasher};
 use rustyline::DefaultEditor;
-use tokio::runtime::Runtime;
 
 use crate::state::AppState;
 
 pub fn run(state: Arc<AppState>) {
-    // 独立线程 + 独立 runtime，避免与主 runtime 嵌套
     std::thread::Builder::new()
         .name("echat-console".into())
         .spawn(move || {
@@ -25,15 +26,18 @@ pub fn run(state: Arc<AppState>) {
                         if line.is_empty() {
                             continue;
                         }
-                        let _ = rl.add_history_entry(&line);
+                        // 含密码的命令不进历史
+                        let lower = line.to_lowercase();
+                        let is_secret = lower.starts_with("/echat password-op")
+                            || lower.starts_with("/echat password set")
+                            || lower.starts_with("/echat password reset");
+                        if !is_secret {
+                            let _ = rl.add_history_entry(&line);
+                        }
                         rt.block_on(handle(&state, &line));
                     }
-                    Err(rustyline::error::ReadlineError::Interrupted) => {
-                        // Ctrl+C：忽略，继续
-                        continue;
-                    }
+                    Err(rustyline::error::ReadlineError::Interrupted) => continue,
                     Err(rustyline::error::ReadlineError::Eof) => {
-                        // Ctrl+D：退出
                         println!("控制台退出");
                         std::process::exit(0);
                     }
@@ -57,7 +61,9 @@ async fn handle(state: &Arc<AppState>, line: &str) {
         return;
     }
     if tokens.len() < 2 {
-        println!("用法: /Echat <banlist|list|kick|ban|ban-ip|pardon|pardon-ip|op|exit|say> ...");
+        println!(
+            "用法: /Echat <banlist|list|kick|ban|ban-ip|pardon|pardon-ip|op|password-op|exit|say> ..."
+        );
         return;
     }
     match tokens[1].to_lowercase().as_str() {
@@ -69,6 +75,7 @@ async fn handle(state: &Arc<AppState>, line: &str) {
         "pardon" => c_pardon(state, &tokens[2..]).await,
         "pardon-ip" => c_pardon_ip(state, &tokens[2..]).await,
         "op" => c_op(state, &tokens[2..]).await,
+        "password-op" => c_password_op(state, &tokens[2..]).await,
         "exit" => {
             println!("正在关闭服务器...");
             std::process::exit(0);
@@ -78,10 +85,11 @@ async fn handle(state: &Arc<AppState>, line: &str) {
             state.broadcast("Console", &msg).await;
             println!("[Console] {}", msg);
         }
-        other => println!("未知控制台命令: {}", other),
+        other => {
+            println!("未知控制台命令: {}", other);
+        }
     }
 }
-
 
 async fn c_banlist(state: &Arc<AppState>) {
     let rows = sqlx::query_as::<_, (String, String, Option<String>, String)>(
@@ -240,7 +248,6 @@ async fn c_op(state: &Arc<AppState>, args: &[&str]) {
         .execute(&state.db)
         .await;
 
-    // 若在线，立即授予 OP
     if let Some((_, sess)) = state.find_session_by_user(name).await {
         let mut g = sess.lock().await;
         g.is_op = true;
@@ -248,4 +255,32 @@ async fn c_op(state: &Arc<AppState>, args: &[&str]) {
     } else {
         println!("{} 不在线，已记录到 OP 名单", name);
     }
+}
+
+async fn c_password_op(state: &Arc<AppState>, args: &[&str]) {
+    if args.is_empty() {
+        println!("用法: /Echat password-op [PASSWORD-OP]");
+        return;
+    }
+    let new_pwd = args[0];
+    if new_pwd.chars().count() < 4 {
+        println!("OP 密码至少 4 位");
+        return;
+    }
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = match Argon2::default().hash_password(new_pwd.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
+        Err(e) => {
+            println!("哈希失败: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = crate::db::set_setting(&state.db, "op_password_hash", &hash).await {
+        println!("保存失败: {}", e);
+        return;
+    }
+    *state.op_password_hash.write().await = hash;
+    println!("OP 密码已更新（下一次 OP Login 生效）");
 }

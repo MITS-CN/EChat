@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -12,16 +12,18 @@ use crate::session::Session;
 pub struct AppState {
     pub db: SqlitePool,
     pub config: Config,
+    pub op_password_hash: RwLock<String>,
     pub sessions: DashMap<Uuid, Arc<tokio::sync::Mutex<Session>>>,
     pub channels: DashMap<Uuid, mpsc::UnboundedSender<Outgoing>>,
     pub close_tokens: DashMap<Uuid, CancellationToken>,
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, config: Config) -> Self {
+    pub fn new(db: SqlitePool, config: Config, op_password_hash: String) -> Self {
         Self {
             db,
             config,
+            op_password_hash: RwLock::new(op_password_hash),
             sessions: DashMap::new(),
             channels: DashMap::new(),
             close_tokens: DashMap::new(),

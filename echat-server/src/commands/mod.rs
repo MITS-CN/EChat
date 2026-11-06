@@ -12,7 +12,6 @@ use crate::protocol::Outgoing;
 use crate::session::Session;
 use crate::state::AppState;
 
-/// 检查当前会话是否已完成注册，返回用户名
 pub async fn require_user(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -40,7 +39,6 @@ pub async fn get_session(
         .ok_or_else(|| "会话不存在".to_string())
 }
 
-/// 顶层命令分发
 pub async fn dispatch(
     state: Arc<AppState>,
     session_id: Uuid,
@@ -52,7 +50,6 @@ pub async fn dispatch(
         return;
     }
 
-    // 不以 "/" 开头 → 当作 say
     if !trimmed.starts_with('/') {
         say::say_text(state, session_id, trimmed).await;
         return;

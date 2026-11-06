@@ -7,6 +7,9 @@ mod state;
 
 use std::sync::Arc;
 
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::SaltString;
+use argon2::{Argon2, PasswordHasher};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -30,9 +33,27 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let db = db::init_db(&config.db_path).await?;
-    let state = Arc::new(state::AppState::new(db, config.clone()));
 
-    // 控制台命令 task
+    // 加载 / 初始化 OP 密码 hash
+    let op_password_hash = match db::get_setting(&db, "op_password_hash").await {
+        Some(h) => h,
+        None => {
+            let default_pwd =
+                std::env::var("ECHAT_OP_PASSWORD").unwrap_or_else(|_| "admin123".into());
+            let salt = SaltString::generate(&mut OsRng);
+            let hash = Argon2::default()
+                .hash_password(default_pwd.as_bytes(), &salt)
+                .map_err(|e| anyhow::anyhow!("OP 密码哈希失败: {}", e))?
+                .to_string();
+            db::set_setting(&db, "op_password_hash", &hash).await?;
+            info!("首次启动：OP 密码已从环境变量初始化，可用控制台 /Echat password-op 修改");
+            hash
+        }
+    };
+
+    let state = Arc::new(state::AppState::new(db, config.clone(), op_password_hash));
+
+    // 控制台（内部自己起线程 + 独立 runtime）
     let console_state = state.clone();
     commands::console::run(console_state);
 
